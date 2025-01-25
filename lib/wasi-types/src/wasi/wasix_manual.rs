@@ -505,3 +505,90 @@ where
     #[inline]
     fn zero_padding_bytes(&self, _bytes: &mut [MaybeUninit<u8>]) {}
 }
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DlInfo<M: MemorySize> {
+    pub fname: M::Offset,
+    pub fname_len: M::Offset,
+    pub base: M::Offset,
+    pub sname: M::Offset,
+    pub sname_len: M::Offset,
+    pub saddr: M::Offset,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub enum DlFlags {
+    Lazy,
+    Now,
+    Global,
+    Noload,
+    Nodelete,
+    Deepbind,
+    Unknown,
+}
+
+impl core::fmt::Debug for DlFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DlFlags::Lazy => f.debug_tuple("RTLD_LAZY").finish(),
+            DlFlags::Now => f.debug_tuple("RTLD_NOW").finish(),
+            DlFlags::Global => f.debug_tuple("RTLD_GLOBAL").finish(),
+            DlFlags::Noload => f.debug_tuple("RTLD_NOLOAD").finish(),
+            DlFlags::Nodelete => f.debug_tuple("RTLD_NODELETE").finish(),
+            DlFlags::Deepbind => f.debug_tuple("RTLD_DEEPBIND").finish(),
+            DlFlags::Unknown => f.debug_tuple("Unknown").finish(),
+        }
+    }
+}
+
+unsafe impl ValueType for DlFlags {
+    #[inline]
+    fn zero_padding_bytes(&self, _bytes: &mut [MaybeUninit<u8>]) {}
+}
+
+unsafe impl wasmer::FromToNativeWasmType for DlFlags {
+    type Native = i32;
+
+    fn to_native(self) -> Self::Native {
+        self as i32
+    }
+
+    fn from_native(n: Self::Native) -> Self {
+        match n {
+            1 => Self::Lazy,
+            2 => Self::Now,
+            4 => Self::Global,
+            8 => Self::Noload,
+            16 => Self::Nodelete,
+            32 => Self::Deepbind,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn is_from_store(&self, _store: &impl wasmer::AsStoreRef) -> bool {
+        false
+    }
+}
+
+pub type DlHandle = u32;
+
+impl<M: MemorySize> core::fmt::Debug for DlInfo<M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DlInfo")
+            .field("fname", &self.fname)
+            .field("fname_len", &self.fname_len)
+            .field("base", &self.base)
+            .field("sname", &self.sname)
+            .field("sname_len", &self.sname_len)
+            .field("saddr", &self.saddr)
+            .finish()
+    }
+}
+
+unsafe impl<M: MemorySize> ValueType for DlInfo<M> {
+    #[inline]
+    fn zero_padding_bytes(&self, _bytes: &mut [MaybeUninit<u8>]) {}
+}

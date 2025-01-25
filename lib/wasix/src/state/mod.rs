@@ -16,6 +16,7 @@
 #![allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 
 mod builder;
+mod dl;
 mod env;
 mod func_env;
 mod handles;
@@ -30,6 +31,7 @@ use std::{
     time::Duration,
 };
 
+use dl::DlState;
 use run::*;
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
@@ -139,6 +141,7 @@ pub(crate) struct WasiState {
     // TODO: should not be here, since this requires active work to resolve.
     // State should only hold active runtime state that can be reproducibly re-created.
     pub preopen: Vec<String>,
+    pub dl: DlState,
 }
 
 impl WasiState {
@@ -258,6 +261,7 @@ impl WasiState {
             args: Mutex::new(self.args.lock().unwrap().clone()),
             envs: Mutex::new(self.envs.lock().unwrap().clone()),
             preopen: self.preopen.clone(),
+            dl: self.dl.clone(),
         }
     }
 }

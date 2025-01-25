@@ -19,6 +19,7 @@ use crate::{
     capabilities::Capabilities,
     fs::{WasiFs, WasiFsRoot, WasiInodes},
     os::task::control_plane::{ControlPlaneConfig, ControlPlaneError, WasiControlPlane},
+    state::DlState,
     state::WasiState,
     syscalls::{
         rewind_ext2,
@@ -891,6 +892,7 @@ impl WasiEnvBuilder {
             futexs: Default::default(),
             clock_offset: Default::default(),
             envs: std::sync::Mutex::new(conv_env_vars(self.envs)),
+            dl: DlState::new(),
         };
 
         let runtime = self.runtime.unwrap_or_else(|| {
