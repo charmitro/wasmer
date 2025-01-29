@@ -1323,4 +1323,9 @@ impl WasiEnv {
             }
         }
     }
+
+    // Run dynamicly loaded modules destructors
+    pub fn run_destructors(&self, store: &mut impl AsStoreMut) {
+        self.state.dl.call_destructors(store);
+    }
 }

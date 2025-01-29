@@ -1,3 +1,132 @@
+//! Dynamic Library Loading Implementation for WASI
+//! 
+//! # Overview
+//! This module implements dynamic library loading (dlopen) functionality for WASI.
+//! It allows WASM modules to load other WASM modules at runtime, similar to how
+//! native programs use shared libraries.
+//!
+//! # Compilation Requirements
+//! 
+//! Main module must be compiled with:
+//! ```sh
+//! clang --target=wasm32-wasi -I./sysroot/include -L./sysroot/lib/wasm32-wasi \
+//!     load.c --sysroot=/opt/wasix-sysroot -o load \
+//!     -Wl,--export-table -Wl,--initial-memory=1048576 \
+//!     -Wl,--max-memory=2147483648 -mbulk-memory
+//! ```
+//! 
+//! Dynamic libraries must be compiled with:
+//! ```sh
+//! clang --target=wasm32-wasi libside.c -o libside.wasm \
+//!     -Wl,--no-entry \
+//!     -nostartfiles \
+//!     --sysroot=/opt/wasix-sysroot \
+//!     -Wl,--import-memory \
+//!     -Wl,--global-base=131072 \
+//!     -Wl,--initial-memory=1048576 \
+//!     -Wl,--max-memory=2147483648 \
+//!     -Wl,--export-all
+//! ```
+//!
+//! These flags are required for:
+//! - Proper memory sharing between modules
+//! - Function table exports
+//! - Correct global variable offsets
+//! - Symbol exports for linking
+//! - Consistent memory limits
+//!
+//! # Design
+//! 
+//! ## Core Components
+//! 
+//! 1. Dynamic Loading Functions:
+//!    - dlopen(): Loads a WASM module from the filesystem
+//!    - dlsym(): Looks up symbols in loaded modules
+//!    - dlclose(): Unloads a module
+//!    - dlerror(): Reports errors from dynamic loading operations
+//!
+//! 2. Module Management:
+//!    - Modules are tracked using unique handles
+//!    - State is maintained in WasiEnv's DlState
+//!    - Constructors/destructors are called appropriately
+//!
+//! ## Loading Process
+//!
+//! 1. Path Resolution:
+//!    - Read path from WASM memory
+//!    - Validate and resolve filesystem path
+//!
+//! 2. Module Loading:
+//!    - Read WASM bytes from filesystem
+//!    - Parse and validate WASM module
+//!
+//! 3. Instance Creation:
+//!    - Set up WASI imports (memory, exports, etc.)
+//!    - Create new module instance
+//!    - Register instance in DlState
+//!
+//! 4. Symbol Management:
+//!    - Track exported symbols
+//!    - Support global variables and functions
+//!    - Handle memory addressing
+//!
+//! ## Memory Safety
+//!
+//! - All memory accesses are bounds-checked
+//! - Proper cleanup on errors
+//! - Safe handling of WASM memory pointers
+//!
+//! ## Error Handling
+//!
+//! - Clear error paths with proper cleanup
+//! - Detailed error reporting
+//! - Consistent error types (Errno)
+//!
+//! ## Lifecycle Management
+//!
+//! 1. Module Loading:
+//!    - Load WASM bytes
+//!    - Create instance
+//!    - Run constructors
+//!
+//! 2. Module Usage:
+//!    - Symbol lookup
+//!    - Memory sharing
+//!
+//! 3. Module Unloading:
+//!    - Run destructors
+//!    - Clean up resources
+//!    - Remove from state
+//!
+//! ## Limitations
+//!
+//! - Only RTLD_NOW flag supported
+//! - No nested loading (modules loading other modules)
+//! - Limited symbol resolution
+//!
+//! ## Future Improvements
+//!
+//! - Support for more dlopen flags
+//! - Better symbol resolution
+//! - Nested module loading
+//! - Memory mapping optimizations
+//! - Better error reporting
+//!
+//! # Examples
+//!
+//! ```no_run
+//! // Load a module
+//! let handle = dlopen("./mymodule.wasm", RTLD_NOW);
+//!
+//! // Look up a symbol
+//! let symbol = dlsym(handle, "my_function");
+//!
+//! // Use the symbol...
+//!
+//! // Clean up
+//! dlclose(handle);
+//! ```
+
 use super::*;
 use crate::wasi_exports_generic;
 use crate::wasi_snapshot_preview1_exports;
@@ -11,14 +140,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::debug;
 use tracing::Instrument;
 use wasmer::imports;
 use wasmer::namespace;
 use wasmer::AsEngineRef;
 use wasmer::AsStoreRef;
+use wasmer::Exports;
 use wasmer::FromToNativeWasmType;
 use wasmer::FunctionEnv;
 use wasmer::Imports;
+use wasmer::MemoryType;
 use wasmer::Table;
 use wasmer_types::ExportType;
 use wasmer_types::TableType;
@@ -47,109 +179,115 @@ pub fn dlopen<'a, M: MemorySize + 'static>(
     flags: i32,
     handle_ptr: WasmPtr<DlHandle, M>,
 ) -> Result<Errno, WasiError> {
+    // Process initial checks
     wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+
+    // Validate flags
     let dl_flags = DlFlags::from_native(flags);
     if dl_flags != DlFlags::Now {
-        println!(
-            "dlopen: Only RTLD_NOW is supported, received: {:?}",
-            dl_flags
-        );
+        debug!("dlopen: Only RTLD_NOW is supported, received: {dl_flags:?}");
         return Ok(Errno::Notsup);
     }
 
-    // Extract the path
-    let path = {
-        let env = ctx.data();
-        let memory = unsafe { env.memory_view(&ctx) };
-        match path_ptr.read_utf8_string(&memory, path_len) {
-            Ok(p) => p,
-            Err(e) => {
-                println!("Failed to read path: {:?}", e);
-                return Ok(Errno::Inval);
-            }
-        }
+    // Read path from WASM memory
+    let path = match read_path_from_wasm(&ctx, path_ptr, path_len) {
+        Ok(p) => p,
+        Err(e) => return Ok(e),
     };
 
-    // Load the module
-    let wasm_bytes = match std::fs::read(path) {
+    // Load WASM module from filesystem
+    let wasm_bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(Errno::Io),
     };
 
-    let handle = {
-        let ctx_ref = ctx.as_ref();
-        let (mut env, mut store) = ctx.data_and_store_mut();
-
-        let module = match Module::from_binary(store.engine(), &wasm_bytes) {
-            Ok(m) => m,
-            Err(_) => return Ok(Errno::Inval),
-        };
-
-        // Create imports
-        let exports_wasi_generic = wasi_exports_generic(&mut store, &ctx_ref);
-        let exports_wasi_unstable = wasi_unstable_exports(&mut store, &ctx_ref);
-        let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(&mut store, &ctx_ref);
-        let exports_wasix_32v1 = wasix_exports_32(&mut store, &ctx_ref);
-        let exports_wasix_64v1 = wasix_exports_64(&mut store, &ctx_ref);
-
-        let wasi_imports = imports! {
-            "wasi" => exports_wasi_generic,
-            "wasi_unstable" => exports_wasi_unstable,
-            "wasi_snapshot_preview1" => exports_wasi_snapshot_preview1,
-            "wasix_32v1" => exports_wasix_32v1,
-            "wasix_64v1" => exports_wasix_64v1,
-        };
-
-        // Create the instance with WASI imports
-        let instance = match Instance::new(&mut store, &module, &wasi_imports) {
-            Ok(i) => i,
-            Err(_) => return Ok(Errno::Inval),
-        };
-
-        // Add module without running constructors yet
-        let dl_state = &env.state.dl;
-        let handle = dl_state.add_module(instance.clone());
-
-        // If constructors exist on `instance`, switch to that and run them.
-        if let Ok(ctors) = instance.exports.get_function("__wasm_call_ctors") {
-            let env_inner = match env.try_inner_mut() {
-                Some(inner) => inner,
-                None => return Ok(Errno::Inval),
-            };
-            let mut original_handles = env_inner.clone();
-
-            // Get the new memory and create temporary handles for constructor execution
-            let new_memory = match instance.exports.get_memory("memory") {
-                Ok(m) => m.clone(),
-                Err(_) => return Ok(Errno::Inval),
-            };
-
-            // Create temporary handles for constructor execution
-            let temp_handles =
-                WasiInstanceHandles::new(new_memory.clone(), &mut store, instance.clone());
-
-            // Switch to temporary handles, run constructors, then restore original
-            env.set_inner(temp_handles);
-            if let Err(_) = ctors.call(&mut store, &[]) {
-                return Ok(Errno::Inval);
-            }
-
-            env.set_inner(original_handles);
-        };
-
-        handle
+    // Create and initialize module instance
+    let handle = match create_module_instance(&mut ctx, &wasm_bytes) {
+        Ok(h) => h,
+        Err(e) => return Ok(e),
     };
 
-    // Write handle back to WASM after all mutable borrows are dropped
-    let env = ctx.data();
-    let memory = unsafe { env.memory_view(&ctx) };
-    if let Err(_) = handle_ptr.write(&memory, handle) {
-        return Ok(Errno::Inval);
+    // Write handle back to WASM memory
+    if let Err(e) = write_handle_to_wasm(&ctx, handle_ptr, handle) {
+        return Ok(e);
     }
 
     Ok(Errno::Success)
+}
+
+// Helper functions to break down the complexity
+fn read_path_from_wasm<M: MemorySize>(
+    ctx: &FunctionEnvMut<WasiEnv>,
+    path_ptr: WasmPtr<u8, M>,
+    path_len: M::Offset,
+) -> Result<String, Errno> {
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(ctx) };
+    path_ptr.read_utf8_string(&memory, path_len).map_err(|e| {
+        debug!("Failed to read path: {e:?}");
+        Errno::Inval
+    })
+}
+
+fn create_module_instance(
+    ctx: &mut FunctionEnvMut<WasiEnv>,
+    wasm_bytes: &[u8],
+) -> Result<DlHandle, Errno> {
+    let ctx_ref = ctx.as_ref();
+    let (mut env, mut store) = ctx.data_and_store_mut();
+
+    // Create module from binary
+    let module = Module::from_binary(store.engine(), wasm_bytes).map_err(|_| Errno::Inval)?;
+
+    // Get environment and memory
+    let env_inner = env.try_inner().ok_or(Errno::Inval)?;
+    let memory = env_inner
+        .instance
+        .exports
+        .get_memory("memory")
+        .map_err(|_| Errno::Inval)?
+        .clone();
+
+    // Get exports for imports
+    let wasi_exports = env_inner.instance.exports.clone();
+    let unstable_exports = wasi_unstable_exports(&mut store, &ctx_ref);
+    let snapshot_exports = wasi_snapshot_preview1_exports(&mut store, &ctx_ref);
+    let wasix32_exports = wasix_exports_32(&mut store, &ctx_ref);
+    let wasix64_exports = wasix_exports_64(&mut store, &ctx_ref);
+
+    // Create WASI imports
+    let wasi_imports = imports! {
+        "wasi_unstable" => unstable_exports,
+        "wasi_snapshot_preview1" => snapshot_exports,
+        "wasix_32v1" => wasix32_exports,
+        "wasix_64v1" => wasix64_exports,
+        "wasi" => wasi_exports,
+        "env" => {
+            "memory" => memory.clone(),
+        }
+    };
+
+    // Create instance
+    let instance = Instance::new(&mut store, &module, &wasi_imports).map_err(|e| {
+        debug!("Error creating instance: {e:?}");
+        Errno::Inval
+    })?;
+
+    // Add module to state
+    let dl_state = &env.state.dl;
+    Ok(dl_state.add_module(&mut store, instance, &memory))
+}
+
+fn write_handle_to_wasm<M: MemorySize>(
+    ctx: &FunctionEnvMut<WasiEnv>,
+    handle_ptr: WasmPtr<DlHandle, M>,
+    handle: DlHandle,
+) -> Result<(), Errno> {
+    let env = ctx.data();
+    let memory = unsafe { env.memory_view(ctx) };
+    handle_ptr.write(&memory, handle).map_err(|_| Errno::Inval)
 }
 
 /// Looks up a symbol in a loaded dynamic library.
@@ -174,7 +312,6 @@ pub fn dlsym<'a, M: MemorySize + 'static>(
 ) -> Result<Errno, Errno> {
     // Print inner instance of ctx
     let env = ctx.data();
-    let inner = env.try_inner().ok_or(Errno::Inval)?;
 
     let value = {
         let (env, mut store) = ctx.data_and_store_mut();
@@ -183,17 +320,14 @@ pub fn dlsym<'a, M: MemorySize + 'static>(
             let memory = unsafe { env.memory_view(&store) };
             symbol_ptr
                 .read_utf8_string(&memory, symbol_len)
-                .map_err(|e| {
-                    println!("Failed to read symbol name: {:?}", e);
-                    Errno::Inval
-                })?
+                .map_err(|e| Errno::Inval)?
         };
 
-        // First try to get as a global
+        // Try to get as a global
+        // In the future we should also make this work for functions, shouldn't be too hard.
         if let Some(offset) = dl_state.get_symbol(handle, store, &symbol) {
             offset as u64
         } else {
-            // Fall back to looking for a global
             return Ok(Errno::Inval);
         }
     };

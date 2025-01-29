@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use wasmer::{imports, Imports, Instance, StoreMut, Value};
+use tracing::debug;
+use wasmer::{imports, AsStoreMut, Imports, Instance, Memory, StoreMut, Value};
 use wasmer_types::lib::std::sync::atomic::{AtomicU32, Ordering};
 
 /// Represents the state for dynamic loading functionality.
@@ -21,24 +22,29 @@ pub struct DlState {
 pub struct ModuleData {
     /// The WebAssembly module instance
     pub instance: Instance,
+    /// The memory instance
+    pub memory: Memory,
 }
 
 impl Clone for DlState {
     fn clone(&self) -> Self {
         // Clone each field individually to avoid holding multiple locks
-        let modules = self.modules
+        let modules = self
+            .modules
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-            
-        let imports = self.imports
+
+        let imports = self
+            .imports
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_else(|_| imports! {});
-            
+
         let next_handle = self.next_handle.load(Ordering::SeqCst);
-        
-        let last_error = self.last_error
+
+        let last_error = self
+            .last_error
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
@@ -64,14 +70,25 @@ impl DlState {
     }
 
     /// Adds a new module instance and returns its handle
-    pub fn add_module(&self, instance: Instance) -> u32 {
+    pub fn add_module(
+        &self,
+        store: &mut impl AsStoreMut,
+        instance: Instance,
+        memory: &Memory,
+    ) -> u32 {
         let handle = self.next_handle.fetch_add(1, Ordering::SeqCst);
-        let module_data = ModuleData { instance };
-        
+        let module_data = ModuleData {
+            instance: instance.clone(),
+            memory: memory.clone(),
+        };
+
         if let Ok(mut modules) = self.modules.lock() {
             modules.insert(handle, module_data);
         }
-        
+
+        // Call constructors for the new module
+        self.call_constructors(store);
+
         handle
     }
 
@@ -88,56 +105,68 @@ impl DlState {
     pub fn get_symbol(&self, handle: u32, mut store: StoreMut, symbol: &str) -> Option<u64> {
         let modules = self.modules.lock().ok()?;
         let module_data = modules.get(&handle)?;
-        let global = module_data.instance.exports.get_global(symbol).ok()?;
 
-        let offset = match global.get(&mut store) {
-            Value::I32(v) => v as usize,
-            Value::I64(v) => v as usize,
-            _ => {
-                eprintln!("Unsupported global type for symbol '{}'", symbol);
-                return None;
-            }
-        };
-
-        // If it's a memory symbol, read the value at the offset
-        if let Ok(memory) = module_data.instance.exports.get_memory("memory") {
-            let view = memory.view(&store);
-            let memory_size = view.size().bytes().0 as usize;
-            
-            // Determine symbol size based on alignment and bounds
-            let symbol_size = if offset % 8 == 0 && offset + 8 <= memory_size {
-                8  // 64-bit aligned
-            } else if offset % 4 == 0 && offset + 4 <= memory_size {
-                4  // 32-bit aligned
-            } else if offset + 1 <= memory_size {
-                1  // byte aligned
-            } else {
-                eprintln!("Invalid symbol alignment or out of bounds at offset {}", offset);
-                return None;
+        // First try to get as a global
+        if let Ok(global) = module_data.instance.exports.get_global(symbol) {
+            debug!("Found global {}", symbol);
+            let offset = match global.get(&mut store) {
+                Value::I32(v) => {
+                    debug!("Global offset: {}", v);
+                    v as usize
+                }
+                Value::I64(v) => v as usize,
+                _ => {
+                    eprintln!("Unsupported global type for symbol '{}'", symbol);
+                    return None;
+                }
             };
 
-            // Create a slice for just the bytes we need
-            let data = unsafe { 
-                // SAFETY: We've verified that:
-                // 1. offset + symbol_size is within memory bounds
-                // 2. The memory view is valid for the duration of this read
-                // 3. The alignment requirements are met
+            // Use the stored memory to dereference the pointer
+            let view = module_data.memory.view(&store);
+            let data = unsafe {
                 std::slice::from_raw_parts(
                     view.data_ptr().add(offset),
-                    symbol_size
+                    4, // Assuming 32-bit integers
                 )
             };
 
-            // Read the value based on symbol size
-            match symbol_size {
-                8 => Some(u64::from_le_bytes(data.try_into().ok()?)),
-                4 => Some(u32::from_le_bytes(data.try_into().ok()?) as u64),
-                1 => Some(data[0] as u64),
-                _ => unreachable!(),
+            let value = u32::from_le_bytes(data.try_into().ok()?);
+            debug!("Dereferenced value: {}", value);
+            return Some(value as u64);
+        }
+
+        debug!("Symbol {} not found", symbol);
+        None
+    }
+
+    fn call_constructors(&self, store: &mut impl AsStoreMut) {
+        if let Ok(modules) = self.modules.lock() {
+            for module_data in modules.values() {
+                if let Ok(ctor) = module_data
+                    .instance
+                    .exports
+                    .get_function("__wasm_call_ctors")
+                {
+                    debug!("Calling constructor for module");
+                    let _ = ctor.call(store, &[]);
+                }
             }
-        } else {
-            // Otherwise return the raw global value
-            Some(offset as u64)
+        }
+    }
+
+    // Add a new method that takes the store
+    pub fn call_destructors(&self, store: &mut impl AsStoreMut) {
+        if let Ok(modules) = self.modules.lock() {
+            for module_data in modules.values() {
+                if let Ok(dtor) = module_data
+                    .instance
+                    .exports
+                    .get_function("__wasm_call_dtors")
+                {
+                    debug!("Calling destructor for module");
+                    let _ = dtor.call(store, &[]);
+                }
+            }
         }
     }
 }

@@ -53,6 +53,10 @@ pub fn proc_exit<M: MemorySize>(
         return Ok(());
     }
 
+    // Call destructors before exiting
+    let (env, mut store) = ctx.data_and_store_mut();
+    env.run_destructors(&mut store);
+
     // Otherwise just exit
     Err(WasiError::Exit(code))
 }
